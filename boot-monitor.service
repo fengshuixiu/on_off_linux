@@ -1,0 +1,33 @@
+[Unit]
+Description=Boot Counter and Hardware Check Service
+Documentation=man:systemd.service(5)
+# 等待系统完全启动后再执行硬件检测
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=oneshot
+# 先执行计数（最关键，确保断电也能记录）
+ExecStart=/opt/boot_monitor/boot_counter.sh
+# 输出到控制台和日志，让用户看到进度
+StandardOutput=journal+console
+StandardError=journal+console
+RemainAfterExit=no
+
+# 关机时快速退出，不要等待
+TimeoutStopSec=1
+
+# 运行环境设置
+User=root
+Group=root
+WorkingDirectory=/opt/boot_monitor
+
+# 启动超时设置（5分钟）
+TimeoutStartSec=300
+
+# 确保IO优先
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+
+[Install]
+WantedBy=multi-user.target
