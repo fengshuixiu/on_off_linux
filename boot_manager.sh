@@ -28,6 +28,13 @@ ERROR_LOG="${LOG_ERROR_DIR}/error.log"
 DMESG_LOG="${LOG_DMESG_DIR}/dmesg.log"
 REBOOT_COUNT_FILE="${SCRIPT_DIR}/reboot_remaining.txt"
 SERVICE_NAME="boot-monitor.service"
+# systemd 把开机流程拆成两段：早段只计数，晚段报告由 timer 触发。
+# 服务管理必须成对处理，否则会出现"计数已禁用、报告仍在跑"的半卸载状态。
+REPORT_SERVICE_NAME="boot-monitor-report.service"
+REPORT_TIMER_NAME="boot-monitor-report.timer"
+if [ -f "${SCRIPT_DIR}/platform.sh" ]; then
+    . "${SCRIPT_DIR}/platform.sh"
+fi
 
 # 颜色定义
 RED='\033[0;31m'
@@ -68,27 +75,35 @@ show_status() {
     fi
     
     # 检查服务状态
-    if systemctl is-enabled "$SERVICE_NAME" &>/dev/null; then
+    if command -v plat_service_enabled >/dev/null 2>&1; then
+        if plat_service_enabled "$SERVICE_NAME"; then
+            SERVICE_STATUS="${GREEN}已启用${NC}"
+        else
+            SERVICE_STATUS="${RED}未启用${NC}"
+        fi
+    elif systemctl is-enabled "$SERVICE_NAME" &>/dev/null; then
         SERVICE_STATUS="${GREEN}已启用${NC}"
     else
         SERVICE_STATUS="${RED}未启用${NC}"
     fi
     
     # 统计日志数量
-    LOG_COUNT=0
     if [ -d "$LOG_BOOT_DIR" ]; then
-        LOG_COUNT=$(find "$LOG_BOOT_DIR" -maxdepth 1 -name "boot_*.log" 2>/dev/null | wc -l)
+        LOG_COUNT=$(ls -1 "$LOG_BOOT_DIR"/boot_*.log 2>/dev/null | wc -l)
+    else
+        LOG_COUNT=0
     fi
-    DMESG_COUNT=0
     if [ -d "$LOG_DMESG_DIR" ]; then
-        DMESG_COUNT=$(find "$LOG_DMESG_DIR" -maxdepth 1 -name "dmesg_boot*.log" 2>/dev/null | wc -l)
+        DMESG_COUNT=$(ls -1 "$LOG_DMESG_DIR"/dmesg_boot*.log 2>/dev/null | wc -l)
+    else
+        DMESG_COUNT=0
     fi
     
     echo -e "${BLUE}【当前状态】${NC}"
     echo -e "  开机次数: ${YELLOW}${BOOT_COUNT}${NC}"
     echo -e "  服务状态: ${SERVICE_STATUS}"
     echo -e "  开机日志: ${YELLOW}${LOG_COUNT}${NC} 个"
-    if [ "$DMESG_COUNT" -gt 0 ]; then
+    if [ $DMESG_COUNT -gt 0 ]; then
         echo -e "  错误快照: ${RED}${DMESG_COUNT}${NC} 个 (dmesg)"
     fi
     echo -e "  安装路径: ${SCRIPT_DIR}"
@@ -130,15 +145,10 @@ view_boot_count() {
         
         # 显示最近一次开机时间
         LATEST_LOG=$(ls -t "$LOG_BOOT_DIR"/boot_*.log 2>/dev/null | head -1)
-        NORMAL_LOG="${LOG_BOOT_DIR}/normal_summary.log"
-        
         if [ -n "$LATEST_LOG" ]; then
             echo "  最近一次开机记录:"
             grep "开机时间:" "$LATEST_LOG" 2>/dev/null | sed 's/^/    /'
             grep "运行时长:" "$LATEST_LOG" 2>/dev/null | sed 's/^/    /'
-        elif [ -f "$NORMAL_LOG" ] && [ -s "$NORMAL_LOG" ]; then
-            echo "  最近一次启动摘要:"
-            tail -1 "$NORMAL_LOG" | sed 's/^/    /'
         fi
     else
         echo -e "  ${RED}计数器文件不存在${NC}"
@@ -147,6 +157,24 @@ view_boot_count() {
     echo ""
     read -p "按回车键返回..." dummy
 }
+
+# 管理操作与开机任务共用锁；替换成功后才报告写入成功。
+save_boot_count() (
+    local tmp
+    [ ! -d "$COUNTER_FILE" ] || return 1
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"${SCRIPT_DIR}/.boot_counter.lock" || return 1
+        flock -n 9 || { echo "启动检测正在运行，请稍后修改计数" >&2; return 1; }
+    fi
+    tmp=$(mktemp "${COUNTER_FILE}.XXXXXX") || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+    printf '%s\n' "$1" > "$tmp" && chmod 644 "$tmp" || return 1
+    if command -v plat_atomic_replace >/dev/null 2>&1; then
+        plat_atomic_replace "$tmp" "$COUNTER_FILE" && sync
+    else
+        mv -f "$tmp" "$COUNTER_FILE" && sync
+    fi
+)
 
 # 2. 设置开机次数
 set_boot_count() {
@@ -167,12 +195,13 @@ set_boot_count() {
     read NEW_COUNT
     
     # 验证输入
-    if ! [[ "$NEW_COUNT" =~ ^[0-9]+$ ]]; then
-        echo -e "  ${RED}错误: 请输入有效的数字${NC}"
+    if ! [[ "$NEW_COUNT" =~ ^[0-9]{1,18}$ ]]; then
+        echo -e "  ${RED}错误: 请输入不超过18位的非负整数${NC}"
         sleep 2
         return
     fi
     
+    NEW_COUNT=$((10#$NEW_COUNT))
     if [ "$NEW_COUNT" -eq 0 ]; then
         echo "  操作已取消"
         sleep 1
@@ -180,8 +209,10 @@ set_boot_count() {
     fi
     
     # 保存新值
-    echo "$NEW_COUNT" > "$COUNTER_FILE"
-    sync
+    if ! save_boot_count "$NEW_COUNT"; then
+        echo "错误: 无法保存开机次数" >&2
+        return 1
+    fi
     echo -e "  ${GREEN}✓ 开机次数已设置为: ${NEW_COUNT}${NC}"
     
     echo ""
@@ -205,8 +236,10 @@ reset_boot_count() {
     read CONFIRM
     
     if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-        echo "0" > "$COUNTER_FILE"
-        sync
+        if ! save_boot_count 0; then
+            echo "错误: 无法重置开机次数" >&2
+            return 1
+        fi
         echo -e "  ${GREEN}✓ 开机次数已重置为 0${NC}"
     else
         echo "  操作已取消"
@@ -217,7 +250,11 @@ reset_boot_count() {
 }
 
 # 4. 立即执行硬件检测
-run_hardware_check() {
+run_hardware_check() (
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"${SCRIPT_DIR}/.boot_counter.lock" || return 1
+        flock -n 9 || { echo "启动检测正在运行，请稍后重试" >&2; return 1; }
+    fi
     show_header
     echo -e "${BLUE}【硬件检测】${NC}"
     echo ""
@@ -235,10 +272,22 @@ run_hardware_check() {
     echo ""
     
     # 执行硬件检测并保存结果
-    if bash "${SCRIPT_DIR}/hardware_check.sh" > "${CURRENT_HW_FILE}" 2>&1; then
+    local hw_rc=0
+    if command -v plat_timeout >/dev/null 2>&1; then
+        plat_timeout 300 bash "${SCRIPT_DIR}/hardware_check.sh" > "${CURRENT_HW_FILE}" 2>&1 || hw_rc=$?
+    else
+        timeout 300 bash "${SCRIPT_DIR}/hardware_check.sh" > "${CURRENT_HW_FILE}" 2>&1 || hw_rc=$?
+    fi
+    if { [ "$hw_rc" -eq 0 ] || [ "$hw_rc" -eq 2 ]; } &&
+       grep -qxF '设备标识格式: v5' "${CURRENT_HW_FILE}" &&
+       grep -q '^完成时间: ' "${CURRENT_HW_FILE}" && grep -q '^  - ' "${CURRENT_HW_FILE}"; then
         cat "${CURRENT_HW_FILE}"
         echo ""
-        echo -e "${GREEN}✓ 硬件检测完成${NC}"
+        if [ "$hw_rc" -eq 0 ]; then
+            echo -e "${GREEN}✓ 硬件检测完成${NC}"
+        else
+            echo "传感器检测异常，继续比对设备，但不允许更新基准"
+        fi
     else
         echo -e "${RED}✗ 硬件检测执行失败${NC}"
         [ -f "${CURRENT_HW_FILE}" ] && cat "${CURRENT_HW_FILE}"
@@ -250,6 +299,7 @@ run_hardware_check() {
     
     # 检查基准文件
     if [ ! -f "${BASELINE_FILE}" ]; then
+        [ "$hw_rc" -eq 0 ] || return "$hw_rc"
         echo -e "${YELLOW}注意: 硬件基准文件不存在${NC}"
         echo ""
         echo -ne "是否以当前检测结果创建基准? (y/N): "
@@ -265,8 +315,8 @@ run_hardware_check() {
         echo ""
         
         # 提取设备列表
-        BASELINE_DEVICES=$(grep -E "^  - " "${BASELINE_FILE}" 2>/dev/null | sort | uniq)
-        CURRENT_DEVICES=$(grep -E "^  - " "${CURRENT_HW_FILE}" 2>/dev/null | sort | uniq)
+        BASELINE_DEVICES=$(grep -E "^  - " "${BASELINE_FILE}" 2>/dev/null | sort)
+        CURRENT_DEVICES=$(grep -E "^  - " "${CURRENT_HW_FILE}" 2>/dev/null | sort)
         
         HAS_CHANGE=0
         
@@ -307,6 +357,7 @@ run_hardware_check() {
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo ""
+        [ "$hw_rc" -eq 0 ] || return "$hw_rc"
         echo -ne "是否更新硬件基准文件? (y/N): "
         read CONFIRM
         if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
@@ -318,7 +369,7 @@ run_hardware_check() {
     
     echo ""
     read -p "按回车键返回..." dummy
-}
+)
 
 # 5. 查看最新日志
 view_latest_log() {
@@ -330,7 +381,7 @@ view_latest_log() {
     NORMAL_LOG="${LOG_BOOT_DIR}/normal_summary.log"
     
     if [ -n "$LATEST_LOG" ]; then
-        echo -e "详细日志: ${GREEN}$(basename "$LATEST_LOG")${NC}"
+        echo -e "详细日志: ${GREEN}$(basename $LATEST_LOG)${NC}"
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         cat "$LATEST_LOG"
@@ -425,7 +476,7 @@ view_log_history() {
                 echo ""
                 
                 INDEX=1
-                echo "$LOGS" | while read -r log; do
+                echo "$LOGS" | while read log; do
                     LOG_NAME=$(basename "$log")
                     LOG_SIZE=$(du -h "$log" | awk '{print $1}')
                     LOG_TIME=$(stat -c %y "$log" 2>/dev/null | cut -d. -f1)
@@ -473,8 +524,8 @@ clean_logs() {
         return
     fi
     
-    BOOT_LOG_COUNT=$(find "$LOG_BOOT_DIR" -maxdepth 1 -name "boot_*.log" 2>/dev/null | wc -l)
-    DMESG_SNAPSHOT_COUNT=$(find "$LOG_DMESG_DIR" -maxdepth 1 -name "dmesg_boot*.log" 2>/dev/null | wc -l)
+    BOOT_LOG_COUNT=$(ls -1 "$LOG_BOOT_DIR"/boot_*.log 2>/dev/null | wc -l)
+    DMESG_SNAPSHOT_COUNT=$(ls -1 "$LOG_DMESG_DIR"/dmesg_boot*.log 2>/dev/null | wc -l)
     ERROR_LOG_SIZE=0
     DMESG_LOG_SIZE=0
     [ -f "${ERROR_LOG}" ] && ERROR_LOG_SIZE=$(du -h "${ERROR_LOG}" 2>/dev/null | awk '{print $1}')
@@ -522,7 +573,7 @@ clean_logs() {
             echo -ne "确认删除? (y/N): "
             read CONFIRM
             if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-                DELETED=$(find "$LOG_BOOT_DIR" -maxdepth 1 -name "boot_*.log" 2>/dev/null | wc -l)
+                DELETED=$(ls -1 "$LOG_BOOT_DIR"/boot_*.log 2>/dev/null | wc -l)
                 rm -f "$LOG_BOOT_DIR"/boot_*.log 2>/dev/null
                 echo -e "${GREEN}✓ 已清理 $DELETED 个开机日志文件${NC}"
             else
@@ -600,7 +651,7 @@ clean_logs() {
                 echo -ne "确认删除? (y/N): "
                 read CONFIRM
                 if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-                    DELETED=$(find "$LOG_DMESG_DIR" -maxdepth 1 -name "dmesg_boot*.log" 2>/dev/null | wc -l)
+                    DELETED=$(ls -1 "$LOG_DMESG_DIR"/dmesg_boot*.log 2>/dev/null | wc -l)
                     rm -f "$LOG_DMESG_DIR"/dmesg_boot*.log 2>/dev/null
                     echo -e "${GREEN}✓ 已清理 $DELETED 个 dmesg 错误快照文件${NC}"
                 else
@@ -632,8 +683,8 @@ clean_logs() {
             echo -ne "确认删除? (y/N): "
             read CONFIRM
             if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-                BOOT_DELETED=$(find "$LOG_BOOT_DIR" -maxdepth 1 -name "boot_*.log" 2>/dev/null | wc -l)
-                DMESG_DELETED=$(find "$LOG_DMESG_DIR" -maxdepth 1 -name "dmesg_boot*.log" 2>/dev/null | wc -l)
+                BOOT_DELETED=$(ls -1 "$LOG_BOOT_DIR"/boot_*.log 2>/dev/null | wc -l)
+                DMESG_DELETED=$(ls -1 "$LOG_DMESG_DIR"/dmesg_boot*.log 2>/dev/null | wc -l)
                 rm -f "$LOG_BOOT_DIR"/*.log 2>/dev/null
                 rm -f "$LOG_ERROR_DIR"/*.log 2>/dev/null
                 rm -f "$LOG_DMESG_DIR"/*.log 2>/dev/null
@@ -703,7 +754,20 @@ service_management() {
     # 显示服务状态
     echo "当前服务状态："
     echo ""
-    systemctl status "$SERVICE_NAME" --no-pager 2>/dev/null | head -10
+    if command -v plat_service_status >/dev/null 2>&1; then
+        if [ "${PLATFORM_INIT:-}" = "systemd" ]; then
+            # 早段只计数，跑完立刻 active(exited)，单看它判断不了报告有没有跑。
+            # 计数服务、报告服务、报告定时器要一起展示。
+            for UNIT in "$SERVICE_NAME" "$REPORT_SERVICE_NAME" "$REPORT_TIMER_NAME"; do
+                plat_service_status "$UNIT"
+                echo ""
+            done
+        else
+            plat_service_status "$SERVICE_NAME"
+        fi
+    else
+        systemctl status "$SERVICE_NAME" --no-pager 2>/dev/null | head -10
+    fi
     
     echo ""
     echo "服务管理选项："
@@ -720,25 +784,48 @@ service_management() {
     case $SERVICE_OPTION in
         1)
             echo ""
-            sudo systemctl enable "$SERVICE_NAME"
+            if command -v plat_service_enable >/dev/null 2>&1; then
+                plat_service_enable "$SERVICE_NAME" || { echo -e "${RED}启用失败${NC}"; return 1; }
+                if [ "${PLATFORM_INIT:-}" = "systemd" ]; then
+                    systemctl enable "$REPORT_TIMER_NAME" || { echo -e "${RED}报告定时器启用失败${NC}"; return 1; }
+                fi
+            else
+                systemctl enable "$SERVICE_NAME" "$REPORT_TIMER_NAME"
+            fi
             echo -e "${GREEN}✓ 服务已启用${NC}"
             ;;
         2)
             echo ""
-            sudo systemctl disable "$SERVICE_NAME"
+            if command -v plat_service_disable >/dev/null 2>&1; then
+                plat_service_disable "$SERVICE_NAME" || { echo -e "${RED}禁用失败${NC}"; return 1; }
+                if [ "${PLATFORM_INIT:-}" = "systemd" ]; then
+                    systemctl stop "$REPORT_TIMER_NAME" 2>/dev/null || true
+                    systemctl disable "$REPORT_TIMER_NAME" || { echo -e "${RED}报告定时器禁用失败${NC}"; return 1; }
+                fi
+            else
+                systemctl disable "$SERVICE_NAME" "$REPORT_TIMER_NAME"
+            fi
             echo -e "${YELLOW}✓ 服务已禁用${NC}"
             ;;
         3)
             echo ""
-            echo "正在运行..."
-            sudo bash "${SCRIPT_DIR}/boot_counter.sh"
+            echo "正在运行（报告阶段，不改变开机计数）..."
+            # 计数只在开机早段做，手动运行重跑硬件检测与比对，因此不能走 all
+            BOOT_MONITOR_FORCE=1 bash "${SCRIPT_DIR}/boot_counter.sh" report
             ;;
         4)
             clear
             echo -e "${BLUE}【服务日志】${NC}"
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            sudo journalctl -u "$SERVICE_NAME" -n 50 --no-pager
+            if [ "${PLATFORM_INIT:-}" = "systemd" ]; then
+                # 两段各一个单元，只看计数单元会漏掉硬件检测与耗时判定的输出
+                journalctl -u "$SERVICE_NAME" -u "$REPORT_SERVICE_NAME" -n 50 --no-pager
+            elif command -v plat_service_logs >/dev/null 2>&1; then
+                plat_service_logs "$SERVICE_NAME" 50
+            else
+                journalctl -u "$SERVICE_NAME" -n 50 --no-pager
+            fi
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             ;;
         0|*)
@@ -776,15 +863,16 @@ system_info() {
     echo ""
     echo "CPU 信息:"
     grep "model name" /proc/cpuinfo | head -1 | cut -d: -f2 | sed 's/^/  /'
-    echo "  CPU 核心数: $(nproc)"
+    echo "  CPU 核心数: $(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 未知)"
     
     echo ""
     echo "内存信息:"
-    free -h | grep "Mem:" | awk '{print "  总内存: "$2"  已用: "$3"  可用: "$7}'
+    free -h 2>/dev/null | grep "Mem:" | awk '{print "  总内存: "$2"  已用: "$3"  可用: "$7}' ||
+        free 2>/dev/null | grep "Mem:" | awk '{print "  总内存: "$2"  已用: "$3"  可用: "$4}'
     
     echo ""
     echo "磁盘使用:"
-    df -h / | tail -1 | awk '{print "  根分区: "$2"  已用: "$3" ("$5")  可用: "$4}'
+    df -h / 2>/dev/null | tail -1 | awk '{print "  根分区: "$2"  已用: "$3" ("$5")  可用: "$4}'
     
     echo ""
     read -p "按回车键返回..." dummy
@@ -855,7 +943,7 @@ view_dmesg_logs() {
                 echo ""
                 
                 INDEX=1
-                echo "$DMESG_SNAPSHOTS" | while read -r snapshot; do
+                echo "$DMESG_SNAPSHOTS" | while read snapshot; do
                     SNAP_NAME=$(basename "$snapshot")
                     SNAP_SIZE=$(du -h "$snapshot" 2>/dev/null | awk '{print $1}')
                     SNAP_TIME=$(stat -c %y "$snapshot" 2>/dev/null | cut -d. -f1)
@@ -1089,20 +1177,10 @@ configure_autologin() {
             fi
             
             if [ -f "$GDM_CONF" ]; then
-                # 检查是否已配置
-                if grep -q "AutomaticLogin" "$GDM_CONF" 2>/dev/null; then
-                    echo -e "${YELLOW}注意: GDM 已配置自动登录，将更新配置${NC}"
-                    # 备份原文件
-                    cp "$GDM_CONF" "${GDM_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-                    # 删除旧配置
-                    sed -i '/AutomaticLoginEnable/d' "$GDM_CONF"
-                    sed -i '/AutomaticLogin/d' "$GDM_CONF"
-                else
-                    # 备份原文件
-                    cp "$GDM_CONF" "${GDM_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-                fi
+                # 备份原文件
+                cp "$GDM_CONF" "${GDM_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
                 
-                # 添加新配置
+                # 修改配置
                 if grep -q "\[daemon\]" "$GDM_CONF"; then
                     sed -i "/\[daemon\]/a AutomaticLoginEnable = true\nAutomaticLogin = $AUTO_USER" "$GDM_CONF"
                 else
@@ -1122,19 +1200,10 @@ configure_autologin() {
             LIGHTDM_CONF="/etc/lightdm/lightdm.conf"
             
             if [ -f "$LIGHTDM_CONF" ]; then
-                # 检查是否已配置
-                if grep -q "autologin-user" "$LIGHTDM_CONF" 2>/dev/null; then
-                    echo -e "${YELLOW}注意: LightDM 已配置自动登录，将更新配置${NC}"
-                    # 备份原文件
-                    cp "$LIGHTDM_CONF" "${LIGHTDM_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-                    # 删除旧配置
-                    sed -i '/autologin-user/d' "$LIGHTDM_CONF"
-                else
-                    # 备份原文件
-                    cp "$LIGHTDM_CONF" "${LIGHTDM_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
-                fi
+                # 备份原文件
+                cp "$LIGHTDM_CONF" "${LIGHTDM_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
                 
-                # 添加新配置
+                # 修改配置
                 if grep -q "\[Seat:\*\]" "$LIGHTDM_CONF"; then
                     sed -i "/\[Seat:\*\]/a autologin-user=$AUTO_USER" "$LIGHTDM_CONF"
                 else
@@ -1196,6 +1265,17 @@ EOF
 }
 
 # r. 指定次数重启（reboot重启指定次数，每次启动后等待10s再重启）
+# 首次重启和继续测试使用相同的扣减、取消检查及失败处理。
+request_reboot() (
+    local delay="$1" expected="$2"
+    command -v plat_commit_reboot >/dev/null 2>&1 || { echo "错误: 平台适配层缺失，无法安全重启" >&2; return 1; }
+    command -v flock >/dev/null 2>&1 || { echo "错误: 本机未提供 flock，无法安全执行循环重启" >&2; return 1; }
+    exec 8>"${SCRIPT_DIR}/.reboot_request.lock" || return 1
+    flock -n 8 || { echo "已有重启任务在等待，请勿重复启动"; return 1; }
+    sleep "$delay"
+    plat_commit_reboot "$SCRIPT_DIR" "$expected"
+)
+
 reboot_with_count() {
     show_header
     echo -e "${BLUE}【指定次数重启测试】${NC}"
@@ -1211,7 +1291,7 @@ reboot_with_count() {
     # 检查是否有正在进行的重启测试
     if [ -f "$REBOOT_COUNT_FILE" ]; then
         REMAINING=$(cat "$REBOOT_COUNT_FILE" 2>/dev/null || echo "0")
-        if [ "$REMAINING" -gt 0 ] 2>/dev/null; then
+        if [[ "$REMAINING" =~ ^[0-9]{1,18}$ ]] && [ "$((10#$REMAINING))" -gt 0 ]; then
             echo -e "  ${YELLOW}当前正在进行重启测试，剩余 ${REMAINING} 次${NC}"
             echo ""
             echo "  选项:"
@@ -1227,17 +1307,17 @@ reboot_with_count() {
                 1)
                     echo ""
                     echo -e "  ${YELLOW}继续重启测试，15秒后重启...${NC}"
-                    sleep 15
-                    reboot
+                    request_reboot 15 "$REMAINING"
+                    return $?
                     ;;
                 2)
-                    rm -f "$REBOOT_COUNT_FILE"
+                    command -v plat_cancel_reboot >/dev/null 2>&1 && plat_cancel_reboot "$SCRIPT_DIR" || return 1
                     echo -e "  ${GREEN}✓ 重启测试已取消${NC}"
                     sleep 2
                     return
                     ;;
                 3)
-                    rm -f "$REBOOT_COUNT_FILE"
+                    command -v plat_cancel_reboot >/dev/null 2>&1 && plat_cancel_reboot "$SCRIPT_DIR" || return 1
                     ;;
                 *)
                     return
@@ -1256,12 +1336,13 @@ reboot_with_count() {
     read REBOOT_TIMES
     
     # 验证输入
-    if ! [[ "$REBOOT_TIMES" =~ ^[0-9]+$ ]]; then
-        echo -e "  ${RED}错误: 请输入有效的数字${NC}"
+    if ! [[ "$REBOOT_TIMES" =~ ^[0-9]{1,18}$ ]]; then
+        echo -e "  ${RED}错误: 请输入不超过18位的非负整数${NC}"
         sleep 2
         return
     fi
     
+    REBOOT_TIMES=$((10#$REBOOT_TIMES))
     if [ "$REBOOT_TIMES" -eq 0 ]; then
         echo "  操作已取消"
         sleep 1
@@ -1282,11 +1363,28 @@ reboot_with_count() {
     read CONFIRM
     
     if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+        (
+        if command -v flock >/dev/null 2>&1; then
+            exec 9>"${SCRIPT_DIR}/.boot_counter.lock" || return 1
+            flock -n 9 || { echo "启动检测正在运行，请稍后配置重启测试" >&2; return 1; }
+        fi
+        command -v plat_lock_reboot_state >/dev/null 2>&1 && plat_lock_reboot_state "$SCRIPT_DIR" || return 1
         # 将重启次数写入文件
-        echo "$REBOOT_TIMES" > "$REBOOT_COUNT_FILE"
+        # 先完成计数初始化，再发布重启计划，写入失败时不得重启。
+        local count_tmp plan_tmp
+        [ ! -d "$COUNTER_FILE" ] && [ ! -d "$REBOOT_COUNT_FILE" ] || return 1
+        count_tmp=$(mktemp "${COUNTER_FILE}.XXXXXX") || return 1
+        plan_tmp=$(mktemp "${REBOOT_COUNT_FILE}.XXXXXX") || { rm -f -- "$count_tmp"; return 1; }
+        trap 'rm -f -- "$count_tmp" "$plan_tmp"' EXIT
+        printf '%s\n' "$REBOOT_TIMES" > "$plan_tmp" || return 1
         
         # 重置开机计数器为0（重启后第一次将为1）
-        echo "0" > "$COUNTER_FILE"
+        printf '0\n' > "$count_tmp" && chmod 644 "$count_tmp" || return 1
+        if command -v plat_atomic_replace >/dev/null 2>&1; then
+            plat_atomic_replace "$count_tmp" "$COUNTER_FILE" || return 1
+        else
+            mv -f "$count_tmp" "$COUNTER_FILE" || return 1
+        fi
         
         # 清除启动时间基准（重新记录）
         rm -f "${SCRIPT_DIR}/boot_time_baseline.txt"
@@ -1303,7 +1401,13 @@ reboot_with_count() {
         rm -f "${LOG_ERROR_DIR}"/*.log 2>/dev/null
         rm -f "${LOG_DMESG_DIR}"/*.log 2>/dev/null
         
+        if command -v plat_atomic_replace >/dev/null 2>&1; then
+            plat_atomic_replace "$plan_tmp" "$REBOOT_COUNT_FILE" || return 1
+        else
+            mv -f "$plan_tmp" "$REBOOT_COUNT_FILE" || return 1
+        fi
         sync
+        exec 7>&-
         
         echo ""
         echo -e "  ${GREEN}✓ 重启测试已配置${NC}"
@@ -1312,8 +1416,9 @@ reboot_with_count() {
         echo -e "  ${YELLOW}系统将在 5 秒后重启...${NC}"
         echo ""
         echo "  提示: 可以通过 boot-manager 进入此菜单取消测试"
-        sleep 5
-        reboot
+        request_reboot 5 "$REBOOT_TIMES"
+        )
+        return $?
     else
         echo "  重启测试已取消"
         sleep 2
@@ -1346,14 +1451,27 @@ uninstall_system() {
         
         # 1. 停止并禁用服务
         echo "  [1/8] 停止服务..."
-        systemctl stop "$SERVICE_NAME" 2>/dev/null
-        systemctl disable "$SERVICE_NAME" 2>/dev/null
+        if [ "$PLATFORM_INIT" = "systemd" ]; then
+            for UNIT in "$SERVICE_NAME" "$REPORT_SERVICE_NAME" "$REPORT_TIMER_NAME"; do
+                systemctl stop "$UNIT" 2>/dev/null
+                systemctl disable "$UNIT" 2>/dev/null
+            done
+        elif command -v plat_service_disable >/dev/null 2>&1; then
+            plat_service_disable "$SERVICE_NAME" 2>/dev/null || true
+        fi
         echo "    ✓ 服务已停止"
         
         # 2. 删除服务文件
         echo "  [2/8] 删除服务文件..."
-        rm -f "/etc/systemd/system/$SERVICE_NAME"
-        systemctl daemon-reload
+        for UNIT in "$SERVICE_NAME" "$REPORT_SERVICE_NAME" "$REPORT_TIMER_NAME"; do
+            rm -f "/etc/systemd/system/$UNIT"
+        done
+        if [ "$PLATFORM_INIT" = "busybox" ]; then
+            rm -f /etc/init.d/S99boot-monitor
+        elif [ "$PLATFORM_INIT" != "systemd" ]; then
+            rm -f /etc/init.d/boot-monitor
+        fi
+        [ "$PLATFORM_INIT" = "systemd" ] && systemctl daemon-reload
         echo "    ✓ 服务文件已删除"
         
         # 3. 删除全局命令
@@ -1427,7 +1545,10 @@ main() {
         show_header
         show_status
         show_menu
-        read CHOICE
+        if ! IFS= read -r CHOICE; then
+            echo ""
+            return 0
+        fi
         
         case $CHOICE in
             1) view_boot_count ;;

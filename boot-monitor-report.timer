@@ -1,0 +1,17 @@
+[Unit]
+Description=Trigger boot hardware check and report after startup
+Documentation=man:systemd.timer(5)
+# 晚段报告的触发器。OnBootSec 从内核启动计时（不含固件与引导器），必须大于本机
+# userspace 启动耗时：触发时启动事务必须已经结束，否则报告任务会插进还没结束的
+# 事务，systemd-analyze 取不到全链耗时（脚本内还会再等 BOOT_WAIT_MAX_SEC 秒兜底）。
+# 参考：111 的 userspace 约 23 秒，这里取 30；启动更慢的机器按 systemd-analyze time
+# 的 userspace 段调大，不要改回由 target 拉起。
+# 循环重启的倒计时不从这里起算——脚本会按启动事务结束时刻扣减已过时间。
+
+[Timer]
+OnBootSec=30
+AccuracySec=1s
+Unit=boot-monitor-report.service
+
+[Install]
+WantedBy=timers.target

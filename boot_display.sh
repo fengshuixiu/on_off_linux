@@ -21,6 +21,12 @@ NORMAL_LOG="${LOG_DIR}/boot/normal_summary.log"
 ERROR_LOG="${LOG_DIR}/error/error.log"
 DISPLAY_FLAG="${SCRIPT_DIR}/.display_pending"
 
+# 平台适配层：提供 Wayland 会话环境探测。缺少时仅丢失 wayland 分支，
+# X 下的原有行为不受影响。
+if [ -f "${SCRIPT_DIR}/platform.sh" ]; then
+    . "${SCRIPT_DIR}/platform.sh" || true
+fi
+
 # 检查是否需要显示（由 boot_counter.sh 设置标志）
 if [ ! -f "${DISPLAY_FLAG}" ]; then
     exit 0
@@ -75,7 +81,7 @@ OUTPUT_FILE="/tmp/boot_status_$$.txt"
         echo "  ⚠ 错误记录 (最近3条)："
         echo "  ─────────────────────────────────────────────────"
         # 显示3条错误
-        tail -3 "${ERROR_LOG}" | while read -r line; do
+        tail -3 "${ERROR_LOG}" | while read line; do
             echo "  $line"
         done
         echo "  ─────────────────────────────────────────────────"
@@ -104,6 +110,26 @@ open_terminal() {
         mate-terminal --title="开机状态" -e "bash -c 'cat \"${OUTPUT_FILE}\"; read; rm -f \"${OUTPUT_FILE}\"'"
     elif command -v xterm &>/dev/null; then
         xterm -title "开机状态" -hold -e "cat '${OUTPUT_FILE}'"
+    elif command -v weston-terminal &>/dev/null && \
+         command -v plat_export_wayland_env >/dev/null 2>&1 && plat_export_wayland_env; then
+        # 纯 Wayland 平台（如 Buildroot + weston）上上面的 X 终端与下面的 zenity
+        # 都不存在，weston-terminal 是唯一能上屏的通路。
+        # 注意两件事：一是 --shell 只接受可执行文件路径、不能带参数；
+        # 二是默认等宽字体不含中文字形，因此显式指定中文字体。
+        WRAPPER="${OUTPUT_FILE}.wrapper.sh"
+        {
+            echo '#!/bin/sh'
+            echo "cat '${OUTPUT_FILE}'"
+            echo 'read x'
+            echo "rm -f '${OUTPUT_FILE}' '${WRAPPER}'"
+        } > "${WRAPPER}"
+        chmod +x "${WRAPPER}"
+        if fc-list 2>/dev/null | grep -q 'Source Han Sans CN'; then
+            weston-terminal --fullscreen --font="Source Han Sans CN" --font-size=16 \
+                --shell="${WRAPPER}"
+        else
+            weston-terminal --fullscreen --font-size=16 --shell="${WRAPPER}"
+        fi
     else
         # 使用 zenity 或 notify-send 作为备选
         if command -v zenity &>/dev/null; then

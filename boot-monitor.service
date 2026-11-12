@@ -1,14 +1,14 @@
 [Unit]
-Description=Boot Counter and Hardware Check Service
+Description=Boot Count Service (early stage)
 Documentation=man:systemd.service(5)
-# 等待系统完全启动后再执行硬件检测
-After=multi-user.target
-Wants=multi-user.target
+# 只负责开机计数，越早越好：开机瞬间断电也要把这一次记进计数器。
+# 不能排在拉起本服务的 multi-user.target 之后，否则形成启动顺序循环。
+# 硬件检测、启动耗时判定和循环重启倒计时在晚段（boot-monitor-report.timer）。
+After=local-fs.target
 
 [Service]
 Type=oneshot
-# 先执行计数（最关键，确保断电也能记录）
-ExecStart=/opt/boot_monitor/boot_counter.sh
+ExecStart=/opt/boot_monitor/boot_count.sh
 # 输出到控制台和日志，让用户看到进度
 StandardOutput=journal+console
 StandardError=journal+console
@@ -22,8 +22,8 @@ User=root
 Group=root
 WorkingDirectory=/opt/boot_monitor
 
-# 启动超时设置（5分钟）
-TimeoutStartSec=300
+# 计数在毫秒级完成，30 秒是读坏文件、磁盘慢时的兜底
+TimeoutStartSec=30
 
 # 确保IO优先
 IOSchedulingClass=realtime

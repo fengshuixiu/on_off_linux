@@ -26,6 +26,17 @@ fi
 # 配置
 INSTALL_DIR="/opt/boot_monitor"
 SERVICE_NAME="boot-monitor.service"
+# 晚段报告由 timer 触发，卸载时同样要停掉并删除，否则残留的定时器会继续拉起脚本
+EXTRA_UNITS="boot-monitor-report.service boot-monitor-report.timer"
+
+INIT_SYSTEM="unknown"
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    INIT_SYSTEM="systemd"
+elif [ -x /etc/init.d/S99boot-monitor ]; then
+    INIT_SYSTEM="busybox"
+elif [ -x /etc/init.d/boot-monitor ]; then
+    INIT_SYSTEM="sysv"
+fi
 
 echo "============================================"
 echo "开关机计数和硬件检测系统 - 卸载程序"
@@ -41,7 +52,7 @@ fi
 echo -e "\033[0;31m警告: 此操作将完全删除开机计数系统！\033[0m"
 echo ""
 echo "将删除以下内容:"
-echo "  - systemd 服务"
+echo "  - 开机启动项"
 echo "  - 所有脚本文件"
 echo "  - 所有日志文件"
 echo "  - 开机计数数据"
@@ -64,14 +75,33 @@ echo ""
 
 # 1. 停止并禁用服务
 echo "[1/7] 停止服务..."
-systemctl stop "$SERVICE_NAME" 2>/dev/null || true
-systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+case "$INIT_SYSTEM" in
+    systemd)
+        for UNIT in $SERVICE_NAME $EXTRA_UNITS; do
+            systemctl stop "$UNIT" 2>/dev/null || true
+            systemctl disable "$UNIT" 2>/dev/null || true
+        done
+        ;;
+    busybox)
+        chmod -x /etc/init.d/S99boot-monitor 2>/dev/null || true
+        ;;
+    sysv)
+        command -v update-rc.d >/dev/null 2>&1 && update-rc.d -f boot-monitor remove 2>/dev/null || true
+        chmod -x /etc/init.d/boot-monitor 2>/dev/null || true
+        ;;
+esac
 echo "  ✓ 服务已停止"
 
 # 2. 删除服务文件
 echo "[2/7] 删除服务文件..."
-rm -f "/etc/systemd/system/$SERVICE_NAME"
-systemctl daemon-reload
+for UNIT in $SERVICE_NAME $EXTRA_UNITS; do
+    rm -f "/etc/systemd/system/$UNIT"
+done
+rm -f /etc/init.d/S99boot-monitor
+rm -f /etc/init.d/boot-monitor
+if [ "$INIT_SYSTEM" = "systemd" ]; then
+    systemctl daemon-reload
+fi
 echo "  ✓ 服务文件已删除"
 
 # 3. 删除全局命令
@@ -90,7 +120,7 @@ GETTY_OVERRIDE="/etc/systemd/system/getty@tty1.service.d/override.conf"
 if [ -f "$GETTY_OVERRIDE" ]; then
     rm -f "$GETTY_OVERRIDE"
     rmdir /etc/systemd/system/getty@tty1.service.d 2>/dev/null || true
-    systemctl daemon-reload
+    [ "$INIT_SYSTEM" = "systemd" ] && systemctl daemon-reload
     echo "  ✓ Getty 自动登录配置已清理"
 else
     echo "  - Getty 自动登录未配置，跳过"

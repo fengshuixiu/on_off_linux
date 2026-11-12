@@ -41,11 +41,15 @@ if [ -f "${ERROR_LOG}" ] && [ -s "${ERROR_LOG}" ]; then
     ERROR_COUNT=${ERROR_COUNT// /}
 fi
 
-# 读取启动时间信息
+# 读取启动时间信息（基准文件格式: "<整秒> <来源>"）
 BOOT_TIME_INFO=""
 if [ -f "${BOOT_TIME_FILE}" ]; then
-    BASELINE=$(cat "${BOOT_TIME_FILE}" 2>/dev/null)
-    BOOT_TIME_INFO="基准启动时间: ${BASELINE}秒"
+    BASELINE=$(awk 'NR==1 {print $1}' "${BOOT_TIME_FILE}" 2>/dev/null)
+    BASELINE_SRC=$(awk 'NR==1 {print $2}' "${BOOT_TIME_FILE}" 2>/dev/null)
+    if [ -n "$BASELINE" ]; then
+        BOOT_TIME_INFO="基准启动时间: ${BASELINE}秒"
+        [ -n "$BASELINE_SRC" ] && BOOT_TIME_INFO="${BOOT_TIME_INFO} (来源: ${BASELINE_SRC})"
+    fi
 fi
 
 # 显示状态
@@ -76,7 +80,7 @@ if [ -f "${ERROR_LOG}" ] && [ -s "${ERROR_LOG}" ] && [ "$ERROR_COUNT" -gt 0 ]; t
     echo "  ⚠ 错误记录 (最近3条)："
     echo "  ─────────────────────────────────────────────────────────"
     # 显示3条错误
-    tail -3 "${ERROR_LOG}" | while read -r line; do
+    tail -3 "${ERROR_LOG}" | while read line; do
         echo "  $line"
     done
     echo "  ─────────────────────────────────────────────────────────"
@@ -89,8 +93,8 @@ fi
 echo "════════════════════════════════════════════════════════════"
 echo ""
 
-# 清除显示标志（只显示一次，尝试普通删除，失败则用 sudo）
-rm -f "${DISPLAY_FLAG}" 2>/dev/null || sudo rm -f "${DISPLAY_FLAG}" 2>/dev/null || true
+# 清除显示标志（只显示一次）
+rm -f "${DISPLAY_FLAG}"
 sync
 
 exit 0
